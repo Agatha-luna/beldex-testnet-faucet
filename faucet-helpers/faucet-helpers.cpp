@@ -18,9 +18,24 @@ std::ofstream faucetHelper::logger("beldex-faucet.log", std::ios::app);
 
 faucetHelper::faucetHelper() {
     try {
-        AMOUNT = 10000000000;
-        DATABASE = "beldex.db";
-        WALLET_URL = "http://209.126.86.93:19092/json_rpc";
+        const char* amountEnv = std::getenv("FAUCET_AMOUNT");
+        if (!amountEnv) {
+            logger << "[ERROR] FAUCET_AMOUNT environment variable is not set. Set it in your .env file." << std::endl;
+        }
+        AMOUNT = amountEnv ? std::stoll(amountEnv) : 0;
+
+        const char* dbEnv = std::getenv("FAUCET_DATABASE");
+        if (!dbEnv) {
+            logger << "[ERROR] FAUCET_DATABASE environment variable is not set. Set it in your .env file." << std::endl;
+        }
+        DATABASE = dbEnv ? dbEnv : "";
+
+        const char* walletUrlEnv = std::getenv("WALLET_URL");
+        if (!walletUrlEnv) {
+            logger << "[ERROR] WALLET_URL environment variable is not set. Set it in your .env file." << std::endl;
+        }
+        WALLET_URL = walletUrlEnv ? walletUrlEnv : "";
+
         if (!logger.is_open()) {
             std::cerr << "[ERROR] Cannot open log file." << std::endl;
         }
@@ -311,7 +326,7 @@ RpcReturnType faucetHelper::transferRequest(std::string tnAddr, std::string clie
                     }}
                 ],
                 "account_index": 0,
-                "priority": 1,
+                "priority": 0,
                 "get_tx_key": true
             }}
         }})", AMOUNT, tnAddr);
@@ -368,7 +383,7 @@ RpcReturnType faucetHelper::transferRequest(std::string tnAddr, std::string clie
 
                     if (sqlite3_prepare_v2(db, insert_user, -1, &stmt, nullptr) == SQLITE_OK) {
                         sqlite3_bind_text(stmt, 1, tnAddr.c_str(), -1, SQLITE_STATIC);
-                        sqlite3_bind_int64(stmt, 2, AMOUNT / 1000000000); // 10 BDX
+                        sqlite3_bind_int64(stmt, 2, AMOUNT / 1000000000);
                         sqlite3_bind_text(stmt, 3, clientIP.c_str(), -1, SQLITE_STATIC);
                         sqlite3_bind_text(stmt, 4, timestamp.c_str(), -1, SQLITE_STATIC);
                         sqlite3_step(stmt);
@@ -379,7 +394,7 @@ RpcReturnType faucetHelper::transferRequest(std::string tnAddr, std::string clie
                     sqlite3_finalize(stmt);
 
                     transRes["tx_hash"] = tx_hash;
-                    transRes["amount"] = 10;
+                    transRes["amount"] = AMOUNT / 1000000000;
                     transRes["status"] = true;
 
                     return {transRes, 200};

@@ -7,6 +7,7 @@ find_package(OpenSSL REQUIRED)
 find_package(SQLite3 REQUIRED)
 
 target_include_directories(faucet-helpers PRIVATE ${CMAKE_SOURCE_DIR}/external/Crow/include)
+target_include_directories(faucet-helpers PRIVATE ${CMAKE_SOURCE_DIR}/external/nlohmann_json/include)
 
 # Link dependencies
 target_link_libraries(
@@ -14,6 +15,7 @@ target_link_libraries(
     PRIVATE
         SQLite::SQLite3
         fmt::fmt
-        OpenSSL::SSL         
+        OpenSSL::SSL
         OpenSSL::Crypto
+        cpr
 )

@@ -1,6 +1,8 @@
 #include "crow.h"
 #include <iostream>
 #include <fstream>
+#include <sstream>
+#include <cstdlib>
 #include <nlohmann/json.hpp>
 #include <fmt/core.h>
 #include "faucet-helpers.h"
@@ -9,6 +11,25 @@ using ReturnType = std::tuple<crow::json::wvalue, bool, int>;
 using RpcReturnType = std::tuple<crow::json::wvalue, int>;
 
 namespace nl = nlohmann;
+
+// Loads KEY=VALUE pairs from a .env file into the process environment.
+// Existing environment variables are not overwritten.
+void loadDotenv(const std::string& path = ".env") {
+    std::ifstream file(path);
+    if (!file.is_open()) return;
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = line.substr(0, eq);
+        std::string value = line.substr(eq + 1);
+        setenv(key.c_str(), value.c_str(), 0);
+    }
+}
 
 
 struct CORS {
@@ -35,7 +56,9 @@ struct CORS {
 
   
 int main() {
-    
+
+    loadDotenv();
+
     try {
         crow::App<CORS> app;
 

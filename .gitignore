@@ -28,6 +28,12 @@ install_manifest.txt
 # Logs
 *.log
 
+# Environment variables (secrets)
+.env
+
+# SQLite database (contains user IPs/addresses)
+*.db
+
 # CTest
 Testing/
 CTestTestfile.cmake

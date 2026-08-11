@@ -12,11 +12,10 @@ function submit_key() {
         address: address
     };
 
-    fetch('https://d3fd18a2e482.ngrok-free.app/transfer', {
+    fetch('http://localhost:5000/transfer', {
         method: 'POST',
         headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer your-auth-token'
+            'Content-Type': 'application/json'
         },
         body: JSON.stringify(payload)
     })
@@ -27,7 +26,10 @@ function submit_key() {
         console.log(data);
 
         if(data.status) {
-            document.getElementById('tx-hash').innerHTML = `Transaction Successful! ${data.amount} BDX was sent. Reference: <a href="https://testnet.beldex.dev/tx/${data.tx_hash}" target="_blank" rel="noopener noreferrer">${data.tx_hash}</a>.`;
+            document.getElementById('tx-hash').innerHTML = `Transaction Successful! ${data.amount} BDX was sent. Reference: ${data.tx_hash}.`;
+            setTimeout(() => {
+                document.getElementById('tx-hash').innerHTML = `Transaction Successful! ${data.amount} BDX was sent. Reference: <a href="https://testnet.beldex.dev/tx/${data.tx_hash}" target="_blank" rel="noopener noreferrer">${data.tx_hash}</a>.`;
+            }, 3000);
         } else if (data['tx-error']) {
             document.getElementById('tx-hash').innerHTML = `${data['tx-error']}. Please try again later or <a href="https://testnet.support.beldex.io" target="_blank" rel="noopener noreferrer">contact support</a>.`;
         }else if (data.error) {

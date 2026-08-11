@@ -111,6 +111,18 @@ img {
     overflow-wrap: break-word;
 }
 
+#tx-hash a {
+    color: #00CC0A;
+    text-decoration: none;
+    font-weight: 500;
+    transition: color 0.2s ease;
+}
+
+#tx-hash a:hover,
+#tx-hash a:focus {
+    color: #00FF11;
+}
+
 .eclipse-1 img {
   position: absolute;
   bottom: 0;
