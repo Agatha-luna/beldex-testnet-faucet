@@ -1,16 +1,140 @@
-window.addEventListener('pageshow', function (event) {
-    document.getElementById("key").value = "";
-    document.getElementById('tx-hash').textContent = "";
+const statusWrap = () => document.getElementById('tx-status');
+const statusRow = () => document.getElementById('tx-status-row');
+const submitBtn = () => document.getElementById('submit-btn');
+
+function setStatus(kind, html) {
+    const wrap = statusWrap();
+    const row = statusRow();
+    wrap.hidden = false;
+    row.className = 'tx-status-row' + (kind ? ' ' + kind : '');
+    row.innerHTML = html;
+}
+
+function clearStatus() {
+    statusWrap().hidden = true;
+    statusRow().innerHTML = '';
+}
+
+// ---------- Beldex Wallet extension ----------
+
+let bdxWallet = null;
+let connectedAddress = '';
+
+function setWalletConnectedUI(address) {
+    document.getElementById('wallet-btn-label').textContent = 'Connected';
+    document.getElementById('wallet-btn').title = 'Connected: ' + address + ' (click to disconnect)';
+
+    connectedAddress = address;
+
+    const chip = document.getElementById('address-chip');
+    chip.classList.add('filled');
+    chip.title = address;
+    document.getElementById('address-text').textContent = address;
+
+    // A successful connect makes any earlier connect error stale.
+    clearStatus();
+}
+
+function setWalletDisconnectedUI() {
+    document.getElementById('wallet-btn-label').textContent = 'Connect Wallet';
+    document.getElementById('wallet-btn').title = '';
+
+    connectedAddress = '';
+
+    const chip = document.getElementById('address-chip');
+    chip.classList.remove('filled');
+    chip.title = '';
+    document.getElementById('address-text').textContent = 'Connect your wallet to fill this in';
+}
+
+window.addEventListener('pageshow', function () {
+    bdxWallet = null;
+    setWalletDisconnectedUI();
+    clearStatus();
 });
 
-function submit_key() {
-    document.getElementById('tx-hash').textContent = "Your request is being processed. Please stand by...";
-    address = document.getElementById('key').value;
-    console.log(address);
+async function connectWallet() {
+    const btn = document.getElementById('wallet-btn');
 
-    const payload = {
-        address: address
-    };
+    if (bdxWallet && bdxWallet.isConnected) {
+        try {
+            await bdxWallet.disconnect();
+        } catch (err) {
+            console.error('Wallet disconnect error:', err);
+        }
+        bdxWallet = null;
+        setWalletDisconnectedUI();
+        return;
+    }
+
+    clearStatus();
+
+    if (typeof BdxWeb3 === 'undefined') {
+        setStatus('error', 'Beldex Wallet SDK failed to load. Please refresh the page.');
+        return;
+    }
+
+    btn.disabled = true;
+    document.getElementById('wallet-btn-label').textContent = 'Connecting...';
+
+    try {
+        const provider = await BdxWeb3.detectProvider({ timeoutMs: 3000 });
+
+        if (!provider) {
+            setStatus('error', 'Beldex Wallet extension not found. Please install it and refresh the page.');
+            setWalletDisconnectedUI();
+            return;
+        }
+
+        bdxWallet = new BdxWeb3.BeldexWeb3(provider);
+
+        bdxWallet.on('accountsChanged', account => {
+            if (account && account.address) {
+                setWalletConnectedUI(account.address);
+            } else {
+                setWalletDisconnectedUI();
+            }
+        });
+        bdxWallet.on('disconnect', () => {
+            bdxWallet = null;
+            setWalletDisconnectedUI();
+        });
+
+        const { address } = await bdxWallet.connect();
+        setWalletConnectedUI(address);
+    } catch (err) {
+        console.error('Wallet connect error:', err);
+        bdxWallet = null;
+        setWalletDisconnectedUI();
+
+        if (BdxWeb3.BdxRpcError.isLocked(err)) {
+            setStatus('error', 'Your Beldex Wallet is locked. Unlock the extension and try again.');
+        } else if (BdxWeb3.BdxRpcError.isUserRejection(err)) {
+            setStatus('error', 'Wallet connection request was rejected.');
+        } else if (err.code === 4902) { // ERR.PANEL_CLOSED — wallet's side panel isn't open
+            setStatus('error', err.message);
+        } else {
+            setStatus('error', `Could not connect to Beldex Wallet: ${err.message || err}`);
+        }
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+function submit_key() {
+    const address = connectedAddress.trim();
+
+    if (!address) {
+        setStatus('error', 'Please connect your Beldex Wallet first.');
+        return;
+    }
+
+    const btn = submitBtn();
+    btn.disabled = true;
+    btn.textContent = 'Sending...';
+    setStatus('pending', 'Your request is being processed. Please stand by...');
+
+    const payload = { address: address };
 
     fetch('http://localhost:5000/transfer', {
         method: 'POST',
@@ -19,27 +143,27 @@ function submit_key() {
         },
         body: JSON.stringify(payload)
     })
-    .then(response => {
-        return response.json();
-    })
-    .then(data => {
-        console.log(data);
-
-        if(data.status) {
-            document.getElementById('tx-hash').innerHTML = `Transaction Successful! ${data.amount} BDX was sent. Reference: ${data.tx_hash}.`;
-            setTimeout(() => {
-                document.getElementById('tx-hash').innerHTML = `Transaction Successful! ${data.amount} BDX was sent. Reference: <a href="https://testnet.beldex.dev/tx/${data.tx_hash}" target="_blank" rel="noopener noreferrer">${data.tx_hash}</a>.`;
-            }, 3000);
-        } else if (data['tx-error']) {
-            document.getElementById('tx-hash').innerHTML = `${data['tx-error']}. Please try again later or <a href="https://testnet.support.beldex.io" target="_blank" rel="noopener noreferrer">contact support</a>.`;
-        }else if (data.error) {
-            document.getElementById('tx-hash').textContent = `${data.error}`;
-        } else {
-            document.getElementById('tx-hash').textContent = `Unexpected Response`;
-        }
-    })
-    .catch(error => {
-        console.error('Fetch error: ', error);
-        document.getElementById('tx-hash').textContent = `Fetch error: ${error}`;
-    });
+        .then(response => response.json())
+        .then(data => {
+            if (data.status) {
+                setStatus('success', `Transaction successful! ${data.amount} BDX was sent. Reference: ${data.tx_hash}.`);
+                setTimeout(() => {
+                    setStatus('success', `Transaction successful! ${data.amount} BDX was sent. Reference: <a href="https://testnet.beldex.dev/tx/${data.tx_hash}" target="_blank" rel="noopener noreferrer">${data.tx_hash}</a>.`);
+                }, 3000);
+            } else if (data['tx-error']) {
+                setStatus('error', `${data['tx-error']}. Please try again later or <a href="https://testnet.support.beldex.io" target="_blank" rel="noopener noreferrer">contact support</a>.`);
+            } else if (data.error) {
+                setStatus('error', `${data.error}`);
+            } else {
+                setStatus('error', 'Unexpected response.');
+            }
+        })
+        .catch(error => {
+            console.error('Fetch error: ', error);
+            setStatus('error', `Fetch error: ${error}`);
+        })
+        .finally(() => {
+            btn.disabled = false;
+            btn.textContent = 'Get Faucet';
+        });
 }

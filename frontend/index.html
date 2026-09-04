@@ -7,34 +7,86 @@
     <link rel="icon" type="image/png" sizes="32x32" href="./images/beldox-fav-icon.png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;0,800;0,900;1,100;1,200;1,300;1,400;1,500;1,600;1,700;1,800;1,900&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Michroma&family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="./css/styles.css">
 </head>
 <body>
-    <header class="container">
-        <div class="beldex-logo">
-            <img src="./images/beldex_logo 1.png">
-            <h2>Testnet Faucet</h2>
+    <div id="header">
+        <div id="header-content">
+            <h1 class="Header">
+                <a href="https://beldex.io" target="_blank" rel="noopener noreferrer">
+                    <img src="./images/beldex_logo 1.png" alt="Beldex">
+                </a>
+            </h1>
+            <nav class="site-nav">
+                <a href="https://testnet.support.beldex.io" target="_blank" rel="noopener noreferrer">Support</a>
+            </nav>
         </div>
-    </header>
-    <section class="container">
-        <div class="blur-bg">
-            <div class="eclipse-2">
-                <img src="./images/Ellipse 2.png" alt="">
+    </div>
+
+    <main>
+        <div class="Wrapper">
+            <div class="hero">
+                <div class="hero-text">
+                    <div class="eyebrow">Beldex &middot; Testnet</div>
+                    <h1 class="hero-title">Testnet Faucet</h1>
+                    <p class="hero-note">Request free BDX to test transactions, staking and dApps on the Beldex testnet.</p>
+                </div>
+                <button class="wallet-btn" id="wallet-btn" type="button" onclick="connectWallet()">
+                    <span id="wallet-btn-label">Connect Wallet</span>
+                </button>
             </div>
-            <h5>Enter your beldex testnet address below</h5>
-            <div class="testnet-address">
-                <input class="input-address" type="text" id="key" name ="key" placeholder="Your testnet address here..">
-                <button class="submit-button" type="button" onclick="submit_key()">Get Faucet</button>
+
+            <div class="stat-grid faucet-stat-grid">
+                <div class="stat-card">
+                    <span class="label">Amount per request</span>
+                    <span class="value">20<span class="unit">BDX</span></span>
+                </div>
+                <div class="stat-card">
+                    <span class="label">Cooldown</span>
+                    <span class="value">24<span class="unit">hours</span></span>
+                </div>
+                <div class="stat-card">
+                    <span class="label">Network</span>
+                    <span class="value" style="color: var(--green)">Testnet</span>
+                </div>
             </div>
-            <div class="tx-hash">
-                <h5 id="tx-hash"></h5>
-            </div>
-            <div class="eclipse-1">
-                <img src="./images/Ellipse 1.png" alt="">
+
+            <div class="panel">
+                <div class="panel-head">
+                    <h2 class="title">Request funds</h2>
+                    <span class="spacer"></span>
+                    <span class="meta">One request per address / IP every 24h</span>
+                </div>
+                <div class="panel-body">
+                    <form class="faucet-form" onsubmit="return false;">
+                        <span class="faucet-label">Testnet address</span>
+                        <div class="address-row">
+                            <div class="address-chip" id="address-chip">
+                                <span class="address-text" id="address-text">Connect your wallet to fill this in</span>
+                            </div>
+                            <button class="submit-button" type="button" id="submit-btn" onclick="submit_key()">Get Faucet</button>
+                        </div>
+                    </form>
+
+                    <div class="tx-status" id="tx-status" hidden>
+                        <div class="tx-status-row" id="tx-status-row"></div>
+                    </div>
+                </div>
             </div>
         </div>
-    </section>
+    </main>
+
+    <div id="footer">
+        <div class="Wrapper">
+            <p class="bel-footer">
+                Beldex Testnet Faucet &middot;
+                <a href="https://testnet.support.beldex.io" target="_blank" rel="noopener noreferrer">Support</a>
+            </p>
+        </div>
+    </div>
+
+    <script src="./js/vendor/bdx-web3.global.js"></script>
     <script src="./js/script.js"></script>
 </body>
 </html>
