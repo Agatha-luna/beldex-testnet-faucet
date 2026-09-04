@@ -46,7 +46,7 @@ cp .env.example .env
 | Variable | Description |
 | --- | --- |
 | `WALLET_URL` | Beldex wallet RPC endpoint (`/json_rpc`) used to validate addresses and send faucet funds |
-| `FAUCET_AMOUNT` | Amount sent per request, in atomic units (e.g. `20000000000` = 20 BDX) |
+| `FAUCET_AMOUNT` | Amount sent per request, in atomic units (e.g. `150000000000` = 150 BDX) |
 | `FAUCET_DATABASE` | SQLite database file path used for rate-limit tracking |
 
 All three are required — the server logs an error and refuses to process requests if any are missing.
