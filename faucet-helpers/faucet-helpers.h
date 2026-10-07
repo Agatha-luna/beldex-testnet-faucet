@@ -13,9 +13,9 @@ using RpcReturnType = std::tuple<crow::json::wvalue, int>;
 
 class faucetHelper {
     private:
-        sqlite3* db;
-        int64_t AMOUNT;
-        const char* DATABASE;
+        sqlite3* db = nullptr;
+        int64_t AMOUNT = 0;
+        const char* DATABASE = nullptr;
         std::string WALLET_URL;
         
     public:
