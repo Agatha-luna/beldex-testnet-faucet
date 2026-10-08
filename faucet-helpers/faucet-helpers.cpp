@@ -66,6 +66,42 @@ std::string ipRestrictionKey(const std::string& ip) {
 
 std::ofstream faucetHelper::logger("beldex-faucet.log", std::ios::app);
 
+RpcReturnType faucetHelper::verifyCaptcha(const std::string& token) {
+    crow::json::wvalue response;
+    response["status"] = false;
+    if (token.empty() || token.size() > 2048) {
+        response["error"] = "Complete the CAPTCHA and try again.";
+        return {response, 400};
+    }
+    const char* secret = std::getenv("CAPTCHA_SECRET_KEY");
+    if (!secret || !*secret) {
+        logger << "[ERROR] CAPTCHA_SECRET_KEY is not configured." << std::endl;
+        response["error"] = "CAPTCHA verification is unavailable. Please try again later.";
+        return {response, 503};
+    }
+    try {
+        const auto result = cpr::Post(
+            cpr::Url{"https://challenges.cloudflare.com/turnstile/v0/siteverify"},
+            cpr::Payload{{"secret", secret}, {"response", token}},
+            cpr::Timeout{10000});
+        if (result.error || result.status_code != 200) {
+            response["error"] = "CAPTCHA verification is unavailable. Please try again later.";
+            return {response, 503};
+        }
+        const auto verified = nl::json::parse(result.text);
+        if (!verified.value("success", false) || verified.value("action", "") != "faucet") {
+            response["error"] = "CAPTCHA verification failed. Please complete a new challenge.";
+            return {response, 403};
+        }
+        response["status"] = true;
+        return {response, 200};
+    } catch (const std::exception&) {
+        logger << "[ERROR] CAPTCHA verification response could not be processed." << std::endl;
+        response["error"] = "CAPTCHA verification is unavailable. Please try again later.";
+        return {response, 503};
+    }
+}
+
 faucetHelper::faucetHelper() {
     try {
         const char* amountEnv = std::getenv("FAUCET_AMOUNT");

@@ -67,6 +67,8 @@
                             </div>
                             <button class="submit-button" type="button" id="submit-btn" onclick="submit_key()">Get Faucet</button>
                         </div>
+                        <div id="captcha-widget" style="margin-top: 16px;"></div>
+                        <p id="captcha-note" role="status">Loading CAPTCHA...</p>
                     </form>
 
                     <div class="tx-status" id="tx-status" hidden>
@@ -87,6 +89,8 @@
     </div>
 
     <script src="./js/vendor/bdx-web3.global.js"></script>
-    <script src="./js/script.js"></script>
+    <script src="./js/config.js?v=20261008-2"></script>
+    <script src="./js/script.js?v=20261008-2"></script>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=initCaptcha&amp;render=explicit" async defer onerror="captchaLoadFailed()"></script>
 </body>
 </html>

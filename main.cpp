@@ -66,15 +66,19 @@ int main() {
             crow::json::wvalue res;
 
             try {
-                faucetHelper helper;
                 crow::json::rvalue body = crow::json::load(req.body);
-                if (!body || body.t() != crow::json::type::Object ||
-                    !body.has("address") ||
-                    body["address"].t() != crow::json::type::String) {
-                    res["error"] = "A non-empty address string is required.";
+                if (!body || !body.has("address") || body["address"].t() != crow::json::type::String ||
+                    !body.has("captcha_token") || body["captcha_token"].t() != crow::json::type::String) {
                     res["status"] = false;
+                    res["error"] = "Provide an address and CAPTCHA token.";
                     return crow::response(400, res);
                 }
+
+                auto [captchaResponse, captchaStatus] = faucetHelper::verifyCaptcha(body["captcha_token"].s());
+                if (captchaStatus != 200) {
+                    return crow::response(captchaStatus, captchaResponse);
+                }
+                faucetHelper helper;
 
                 std::string tnAddr = body["address"].s();
                 if (tnAddr.empty()) {

@@ -48,8 +48,23 @@ cp .env.example .env
 | `WALLET_URL` | Beldex wallet RPC endpoint (`/json_rpc`) used to validate addresses and send faucet funds |
 | `FAUCET_AMOUNT` | Amount sent per request, in atomic units (e.g. `150000000000` = 150 BDX) |
 | `FAUCET_DATABASE` | SQLite database file path used for rate-limit tracking |
+| `CAPTCHA_SECRET_KEY` | Cloudflare Turnstile secret key used to verify every faucet request |
 
-All three are required — the server logs an error and refuses to process requests if any are missing.
+All four are required to process faucet requests.
+
+## CAPTCHA setup
+
+Create a Cloudflare Turnstile widget and allow your frontend hostname (including
+`localhost` for local development). Put its public site key in
+`frontend/js/config.js` as `captchaSiteKey`, and its secret key in the root `.env`
+as `CAPTCHA_SECRET_KEY`. Restart the backend after changing `.env`.
+
+The frontend submits `captcha_token` with `address`. The backend verifies it with
+Cloudflare before any wallet RPC or database reservation and requires the `faucet`
+action. Missing, rejected, expired or reused tokens cannot request funds; verification
+outages also block transfers. The widget resets after each request.
+
+See https://developers.cloudflare.com/turnstile/get-started/ for key setup.
 
 ## Build Instructions
 
@@ -87,4 +102,15 @@ cd frontend
 python3 -m http.server 8000
 ```
 
-Then open `http://localhost:8000` in your browser. Make sure `frontend/js/script.js` points at your backend URL (`http://localhost:5000/transfer` for a local backend).
+Then open `http://localhost:8000` in your browser. `frontend/js/config.js` routes
+localhost/127.0.0.1/[::1] on any local frontend port to the backend on port 5000. For hosted deployments,
+it defaults to `/transfer`; configure your reverse proxy to forward that route to
+the backend, or set `apiUrl` to your public backend endpoint. HTTPS pages require
+an HTTPS backend endpoint.
+
+If you receive a non-JSON HTTP 501 response, refresh the page to load the latest
+frontend configuration and check that the request goes to port 5000, rather than
+the static server on port 8000. Start the backend from the project root as shown
+above. Complete CAPTCHA and click **Get Faucet** to submit; completing CAPTCHA
+alone does not send a request. A failed request remains visible while you verify
+again. The backend also requires `CAPTCHA_SECRET_KEY` in `.env`.

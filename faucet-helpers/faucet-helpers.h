@@ -23,6 +23,7 @@ class faucetHelper {
         ~faucetHelper();
 
         static std::ofstream logger;
+        static RpcReturnType verifyCaptcha(const std::string& token);
         bool validateTestnetAddress(std::string tnAddr);
         std::string getClientIP(const crow::request& req);
         ReturnType isIpRestrict(std::string clientIP);

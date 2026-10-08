@@ -11,6 +11,61 @@ function escapeHtml(value) {
         '"': '&quot;'
     })[character]);
 }
+let captchaToken = '';
+let captchaWidgetId = null;
+
+function captchaLoadFailed(errorCode) {
+    captchaToken = '';
+    const code = errorCode ? String(errorCode) : '';
+    const messages = {
+        '110100': 'CAPTCHA site key is invalid. Check the Turnstile configuration.',
+        '110110': 'CAPTCHA site key was not found. Check the Turnstile configuration.',
+        '110200': 'This hostname is not allowed for CAPTCHA. Add it in Cloudflare Turnstile Hostname Management.',
+        '110600': 'CAPTCHA timed out. Check your device clock and refresh the page.',
+        '110620': 'CAPTCHA interaction timed out. Refresh the page to try again.',
+        '200500': 'CAPTCHA could not connect to Cloudflare. Check your network and browser extensions.',
+        '400020': 'CAPTCHA site key is invalid. Check the Turnstile configuration.',
+        '400070': 'CAPTCHA site key is disabled. Check the Turnstile configuration.'
+    };
+    const message = code
+        ? (messages[code] || 'CAPTCHA verification failed. Refresh the page or try another browser.')
+        : 'CAPTCHA script could not load. Check your network and browser extensions, then refresh.';
+    document.getElementById('captcha-note').textContent = message + (code ? ` (Error ${code})` : '');
+    console.error('Turnstile failed:', code || 'script-load-error');
+}
+
+function initCaptcha() {
+    const sitekey = window.FAUCET_CONFIG?.captchaSiteKey;
+    const note = document.getElementById('captcha-note');
+    if (!sitekey) {
+        note.textContent = 'CAPTCHA is not configured. Please contact support.';
+        return;
+    }
+    captchaWidgetId = turnstile.render('#captcha-widget', {
+        sitekey,
+        action: 'faucet',
+        callback: token => {
+            captchaToken = token;
+            note.textContent = 'Verification complete.';
+        },
+        'expired-callback': () => {
+            captchaToken = '';
+            note.textContent = 'Verification expired. Please complete the CAPTCHA again.';
+        },
+        'error-callback': errorCode => {
+            captchaLoadFailed(errorCode);
+            return true;
+        }
+    });
+}
+
+function resetCaptcha() {
+    captchaToken = '';
+    if (captchaWidgetId !== null && window.turnstile) {
+        document.getElementById('captcha-note').textContent = 'Complete the CAPTCHA again, then click Get Faucet to submit a new request.';
+        turnstile.reset(captchaWidgetId);
+    }
+}
 
 function setStatus(kind, html) {
     const wrap = statusWrap();
@@ -57,10 +112,11 @@ function setWalletDisconnectedUI() {
     document.getElementById('address-text').textContent = 'Connect your wallet to fill this in';
 }
 
-window.addEventListener('pageshow', function () {
+window.addEventListener('pageshow', function (event) {
     bdxWallet = null;
     setWalletDisconnectedUI();
     clearStatus();
+    if (event.persisted) resetCaptcha();
 });
 
 async function connectWallet() {
@@ -132,10 +188,22 @@ async function connectWallet() {
 }
 
 function submit_key() {
+    if (submitBtn().disabled) return;
     const address = connectedAddress.trim();
 
     if (!address) {
         setStatus('error', 'Please connect your Beldex Wallet first.');
+        return;
+    }
+
+    if (!captchaToken) {
+        document.getElementById('captcha-note').textContent = 'Please complete the CAPTCHA first, then click Get Faucet.';
+        return;
+    }
+
+    const apiUrl = window.FAUCET_CONFIG?.apiUrl;
+    if (!apiUrl) {
+        setStatus('error', 'Faucet configuration could not load. Refresh the page and try again.');
         return;
     }
 
@@ -144,18 +212,29 @@ function submit_key() {
     btn.textContent = 'Sending...';
     setStatus('pending', 'Your request is being processed. Please stand by...');
 
-    const payload = { address: address };
+    const payload = { address: address, captcha_token: captchaToken };
+    captchaToken = '';
 
-    fetch('/transfer', {
+    fetch(apiUrl, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json'
         },
         body: JSON.stringify(payload)
     })
-        .then(response => response.json())
+        .then(async response => {
+            const text = await response.text();
+            try {
+                return JSON.parse(text);
+            } catch {
+                throw new Error(`The faucet API returned a non-JSON response (HTTP ${response.status}) from ${apiUrl}. The request could not be confirmed. Please contact support.`);
+            }
+        })
         .then(data => {
-            if (data.status) {
+            if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                throw new Error('The faucet API returned an invalid response.');
+            }
+            if (data.status === true) {
                 const amount = escapeHtml(data.amount);
                 const txHash = escapeHtml(data.tx_hash);
                 const txUrl = `https://testnet.beldex.dev/tx/${encodeURIComponent(String(data.tx_hash))}`;
@@ -176,9 +255,10 @@ function submit_key() {
         })
         .catch(error => {
             console.error('Fetch error: ', error);
-            setStatus('error', `Fetch error: ${escapeHtml(error)}`);
+            setStatus('error', escapeHtml(error.message || error));
         })
         .finally(() => {
+            resetCaptcha();
             btn.disabled = false;
             btn.textContent = 'Get Faucet';
         });
