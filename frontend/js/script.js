@@ -131,7 +131,9 @@ async function connectWallet() {
     }
 }
 
-function submit_key() {
+const FAUCET_API = 'http://localhost:5000';
+
+async function submit_key() {
     const address = connectedAddress.trim();
 
     if (!address) {
@@ -139,47 +141,80 @@ function submit_key() {
         return;
     }
 
+    if (!bdxWallet || !bdxWallet.isConnected) {
+        setStatus('error', 'Your Beldex Wallet disconnected. Please connect again.');
+        return;
+    }
+
     const btn = submitBtn();
     btn.disabled = true;
-    btn.textContent = 'Sending...';
-    setStatus('pending', 'Your request is being processed. Please stand by...');
 
-    const payload = { address: address };
+    try {
+        btn.textContent = 'Requesting challenge...';
+        setStatus('pending', 'Preparing a wallet-ownership proof. Please stand by...');
 
-    fetch('/transfer', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-    })
-        .then(response => response.json())
-        .then(data => {
-            if (data.status) {
-                const amount = escapeHtml(data.amount);
-                const txHash = escapeHtml(data.tx_hash);
-                const txUrl = `https://testnet.beldex.dev/tx/${encodeURIComponent(String(data.tx_hash))}`;
-                const warning = data.warning
-                    ? ` ${escapeHtml(data.warning)} Do not submit the transaction again.`
-                    : '';
-                setStatus('success', `Transaction successful! ${amount} BDX was sent. Reference: ${txHash}.${warning}`);
-                setTimeout(() => {
-                    setStatus('success', `Transaction successful! ${amount} BDX was sent. Reference: <a href="${txUrl}" target="_blank" rel="noopener noreferrer">${txHash}</a>.${warning}`);
-                }, 3000);
-            } else if (data['tx-error']) {
-                setStatus('error', `${escapeHtml(data['tx-error'])}. Please try again later or <a href="https://testnet.support.beldex.io" target="_blank" rel="noopener noreferrer">contact support</a>.`);
-            } else if (data.error) {
-                setStatus('error', escapeHtml(data.error));
+        const challengeRes = await fetch(`${FAUCET_API}/challenge?address=${encodeURIComponent(address)}`);
+        const challengeData = await challengeRes.json();
+        if (!challengeRes.ok || !challengeData.challenge) {
+            setStatus('error', escapeHtml(challengeData.error || 'Could not get a signing challenge from the faucet.'));
+            return;
+        }
+
+        btn.textContent = 'Waiting for signature...';
+        setStatus('pending', 'Please approve the signature request in your Beldex Wallet...');
+
+        let signature;
+        try {
+            ({ signature } = await bdxWallet.signMessage(challengeData.challenge));
+        } catch (err) {
+            console.error('Sign message error:', err);
+            if (BdxWeb3.BdxRpcError.isLocked(err)) {
+                setStatus('error', 'Your Beldex Wallet is locked. Unlock the extension and try again.');
+            } else if (BdxWeb3.BdxRpcError.isUserRejection(err)) {
+                setStatus('error', 'Signature request was rejected.');
+            } else if (err.code === 4902) { // ERR.PANEL_CLOSED — wallet's side panel isn't open
+                setStatus('error', err.message);
             } else {
-                setStatus('error', 'Unexpected response.');
+                setStatus('error', `Could not sign the ownership proof: ${escapeHtml(err.message || err)}`);
             }
-        })
-        .catch(error => {
-            console.error('Fetch error: ', error);
-            setStatus('error', `Fetch error: ${escapeHtml(error)}`);
-        })
-        .finally(() => {
-            btn.disabled = false;
-            btn.textContent = 'Get Faucet';
+            return;
+        }
+
+        btn.textContent = 'Sending...';
+        setStatus('pending', 'Your request is being processed. Please stand by...');
+
+        const payload = { address: address, challenge: challengeData.challenge, signature: signature };
+
+        const response = await fetch(`${FAUCET_API}/transfer`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
         });
+        const data = await response.json();
+
+        if (data.status) {
+            const amount = escapeHtml(data.amount);
+            const txHash = escapeHtml(data.tx_hash);
+            const txUrl = `https://testnet.beldex.dev/tx/${encodeURIComponent(String(data.tx_hash))}`;
+            const warning = data.warning
+                ? ` ${escapeHtml(data.warning)} Do not submit the transaction again.`
+                : '';
+            setStatus('success', `Transaction successful! ${amount} BDX was sent. Reference: ${txHash}.${warning}`);
+            setTimeout(() => {
+                setStatus('success', `Transaction successful! ${amount} BDX was sent. Reference: <a href="${txUrl}" target="_blank" rel="noopener noreferrer">${txHash}</a>.${warning}`);
+            }, 3000);
+        } else if (data['tx-error']) {
+            setStatus('error', `${escapeHtml(data['tx-error'])}. Please try again later or <a href="https://testnet.support.beldex.io" target="_blank" rel="noopener noreferrer">contact support</a>.`);
+        } else if (data.error) {
+            setStatus('error', escapeHtml(data.error));
+        } else {
+            setStatus('error', 'Unexpected response.');
+        }
+    } catch (error) {
+        console.error('Fetch error: ', error);
+        setStatus('error', `Fetch error: ${escapeHtml(error)}`);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Get Faucet';
+    }
 }

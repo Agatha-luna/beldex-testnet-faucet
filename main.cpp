@@ -62,6 +62,32 @@ int main() {
     try {
         crow::App<CORS> app;
 
+        // Mint a short-lived, address-bound challenge for the client to sign
+        // with its wallet (e.g. bdx_signMessage) before /transfer will accept it.
+        CROW_ROUTE(app, "/challenge").methods("GET"_method)([](const crow::request& req){
+            crow::json::wvalue res;
+
+            try {
+                faucetHelper helper;
+                char* address = req.url_params.get("address");
+                if (!address || std::string(address).empty()) {
+                    res["error"] = "Query parameter \"address\" is required.";
+                    res["status"] = false;
+                    return crow::response(400, res);
+                }
+
+                res["challenge"] = helper.makeChallenge(address);
+                res["status"] = true;
+                return crow::response(200, res);
+
+            } catch (const std::exception& e) {
+                faucetHelper::logger << "[EXCEPTION] Exception in /challenge handler: " << e.what() << std::endl;
+                res["tx-error"] = "Something went wrong.";
+                res["status"] = false;
+                return crow::response(500, res);
+            }
+        });
+
         CROW_ROUTE(app, "/transfer").methods("POST"_method)([](const crow::request& req){
             crow::json::wvalue res;
 
@@ -83,6 +109,14 @@ int main() {
                     return crow::response(400, res);
                 }
 
+                if (!body.has("challenge") || !body.has("signature")) {
+                    res["error"] = "Wallet signature is required. Please connect your wallet and try again.";
+                    res["status"] = false;
+                    return crow::response(400, res);
+                }
+                std::string challenge = body["challenge"].s();
+                std::string signature = body["signature"].s();
+
                 // Get IP
                 std::string clientIP = helper.getClientIP(req);
                 std::cout << "User IP : " << clientIP << std::endl;
@@ -93,8 +127,10 @@ int main() {
                     return crow::response(500, res);
                 }
 
-                // Fast pre-check. transferRequest repeats this check inside
-                // the transaction that acquires the IP and address locks.
+                // Fast pre-check, before spending effort on address validation
+                // or a signature-verify RPC call. transferRequest repeats this
+                // check atomically inside the transaction that acquires the
+                // IP and address locks.
                 ReturnType ipResult = helper.isIpRestrict(clientIP);
                 auto [ipResponse, isIpRestricted, ipStatusCode] = ipResult;
                 std::cout << "IP Restricted : " << isIpRestricted << std::endl;
@@ -103,27 +139,46 @@ int main() {
                     return crow::response(ipStatusCode, ipResponse);
                 }
 
-                
                 // validate client testnet address
                 bool addressValid = helper.validateTestnetAddress(tnAddr);
                 std::cout << "Address valid : " << addressValid << std::endl;
 
-                if (addressValid) {
-                    RpcReturnType rpcResult = helper.transferRequest(tnAddr, clientIP);
-                    auto [rpcResponse, rpcStatuscode] = rpcResult;
-                    return crow::response(rpcStatuscode, rpcResponse);
-                } else {
+                if (!addressValid) {
                     res["error"] = "The address provided is invalid. Kindly ensure that you enter a valid testnet address and try again.";
                     res["status"] = false;
                     return crow::response(400, res);
                 }
+
+                // The challenge must be one we actually minted for this address,
+                // and not expired.
+                std::string challengeError;
+                if (!helper.checkChallenge(challenge, tnAddr, challengeError)) {
+                    res["error"] = challengeError;
+                    res["status"] = false;
+                    return crow::response(400, res);
+                }
+
+                // Prove the requester actually controls tnAddr's spend key —
+                // closes the "spray addresses nobody owns across rotating IPs"
+                // hole that the IP/address rate limits alone don't catch.
+                if (!helper.verifySignature(tnAddr, challenge, signature)) {
+                    res["error"] = "Could not verify wallet ownership. Please sign the message with the connected wallet and try again.";
+                    res["status"] = false;
+                    return crow::response(401, res);
+                }
+
+                // Transfer faucet. isIpRestrict/isAddressRestrict are re-checked
+                // atomically under lock inside here before anything is sent.
+                RpcReturnType rpcResult = helper.transferRequest(tnAddr, clientIP);
+                auto [rpcResponse, rpcStatuscode] = rpcResult;
+                return crow::response(rpcStatuscode, rpcResponse);
 
             } catch (const std::exception& e) {
                 faucetHelper::logger << "[EXCEPTION] Exception in /transfer handler: " << e.what() << std::endl;
                 res["tx-error"] = "Something went wrong.";
                 res["status"] = false;
                 return crow::response(500, res);
-            
+
             } catch (...) {
                 faucetHelper::logger << "[EXCEPTION] Unknown exception in /transfer handler." << std::endl;
                 res["tx-error"] = "Something went wrong.";

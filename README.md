@@ -45,11 +45,22 @@ cp .env.example .env
 
 | Variable | Description |
 | --- | --- |
-| `WALLET_URL` | Beldex wallet RPC endpoint (`/json_rpc`) used to validate addresses and send faucet funds |
+| `WALLET_URL` | Beldex wallet RPC endpoint (`/json_rpc`) used to validate addresses, verify signatures and send faucet funds |
 | `FAUCET_AMOUNT` | Amount sent per request, in atomic units (e.g. `150000000000` = 150 BDX) |
 | `FAUCET_DATABASE` | SQLite database file path used for rate-limit tracking |
+| `FAUCET_SIGN_SECRET` | Secret used to HMAC-sign wallet-ownership challenges (see below). Generate with `openssl rand -hex 32` |
 
-All three are required — the server logs an error and refuses to process requests if any are missing.
+All four are required — the server logs an error and refuses to process requests if any are missing.
+
+## Proof of wallet ownership
+
+Before paying out, the faucet requires proof that the requester actually controls the private key for the address they're claiming — not just a syntactically valid address. This closes the gap where rotating IPs and spraying addresses nobody owns (e.g. harvested from a block explorer) could otherwise bypass the per-address/per-IP rate limits:
+
+1. `GET /challenge?address=<testnet address>` — mints a short-lived (5 minute), HMAC-signed challenge string bound to that address. Stateless: no database row, just an HMAC the server can re-check later.
+2. The client signs that exact challenge string with the requesting wallet (e.g. the Beldex Wallet browser extension's `bdx_signMessage`, or `beldex-wallet-cli`'s `sign_value`).
+3. `POST /transfer` now requires `{ "address", "challenge", "signature" }`. The server re-validates the challenge (shape, address binding, not expired), then asks the wallet RPC's native `verify` method whether `signature` really was produced by `address`'s spend key over `challenge` — no signature cryptography is implemented in this codebase itself.
+
+This doesn't stop a determined attacker willing to script real wallet creation per request (generating a Beldex keypair is free), but it does stop the much cheaper attack of reusing addresses the requester never held keys for.
 
 ## Build Instructions
 
