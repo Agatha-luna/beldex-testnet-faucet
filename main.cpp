@@ -68,14 +68,40 @@ int main() {
             try {
                 faucetHelper helper;
                 crow::json::rvalue body = crow::json::load(req.body);
-                if (!body)
-                    return crow::response(400, "Invalid JSON");
+                if (!body || body.t() != crow::json::type::Object ||
+                    !body.has("address") ||
+                    body["address"].t() != crow::json::type::String) {
+                    res["error"] = "A non-empty address string is required.";
+                    res["status"] = false;
+                    return crow::response(400, res);
+                }
 
                 std::string tnAddr = body["address"].s();
+                if (tnAddr.empty()) {
+                    res["error"] = "A non-empty address string is required.";
+                    res["status"] = false;
+                    return crow::response(400, res);
+                }
 
                 // Get IP
                 std::string clientIP = helper.getClientIP(req);
                 std::cout << "User IP : " << clientIP << std::endl;
+
+                if (clientIP.empty()) {
+                    res["tx-error"] = "Unable to identify the requesting client.";
+                    res["status"] = false;
+                    return crow::response(500, res);
+                }
+
+                // Fast pre-check. transferRequest repeats this check inside
+                // the transaction that acquires the IP and address locks.
+                ReturnType ipResult = helper.isIpRestrict(clientIP);
+                auto [ipResponse, isIpRestricted, ipStatusCode] = ipResult;
+                std::cout << "IP Restricted : " << isIpRestricted << std::endl;
+
+                if (isIpRestricted) {
+                    return crow::response(ipStatusCode, ipResponse);
+                }
 
                 
                 // validate client testnet address
@@ -83,24 +109,9 @@ int main() {
                 std::cout << "Address valid : " << addressValid << std::endl;
 
                 if (addressValid) {
-                    // Check IP restrict
-                    ReturnType result = helper.isIpRestrict(clientIP);
-
-                    auto [response, is_restricted, statuscode] = result;
-                    std::cout << "IP Statuscode : " << statuscode << std::endl;
-                    std::cout << "IP Restricted : " << is_restricted << std::endl;
-
-
-                    if (!is_restricted) {
-                        // Transfer faucet
-                        RpcReturnType rpcResult = helper.transferRequest(tnAddr, clientIP);
-                        auto [rpcResponse, rpcStatuscode] = rpcResult;
-
-                        return crow::response(rpcStatuscode, rpcResponse);
-                    } else {
-                        return crow::response(statuscode, response);
-                    }
-                    
+                    RpcReturnType rpcResult = helper.transferRequest(tnAddr, clientIP);
+                    auto [rpcResponse, rpcStatuscode] = rpcResult;
+                    return crow::response(rpcStatuscode, rpcResponse);
                 } else {
                     res["error"] = "The address provided is invalid. Kindly ensure that you enter a valid testnet address and try again.";
                     res["status"] = false;
@@ -121,7 +132,7 @@ int main() {
             }
         });
 
-        app.port(5000).multithreaded().run();
+        app.bindaddr("127.0.0.1").port(5000).multithreaded().run();
     }
     catch (const std::exception& e) {
         faucetHelper::logger << "[EXCEPTION] Exception in main: " << e.what() << std::endl;

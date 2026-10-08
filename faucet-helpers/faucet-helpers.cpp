@@ -7,6 +7,7 @@
 #include <sstream>
 #include <iomanip>
 #include <stdexcept>
+#include <cstdint>
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
 #include <fmt/core.h>
@@ -16,6 +17,9 @@ using RpcReturnType = std::tuple<crow::json::wvalue, int>;
 namespace nl = nlohmann;
 
 namespace {
+
+constexpr std::int32_t wallet_connect_timeout_ms = 5000;
+constexpr std::int32_t wallet_request_timeout_ms = 30000;
 
 std::optional<std::string> ipv4SubnetPattern(const std::string& ip) {
     std::size_t start = 0;
@@ -53,6 +57,11 @@ std::optional<std::string> ipv4SubnetPattern(const std::string& ip) {
     return ip.substr(0, third_dot + 1) + "%";
 }
 
+std::string ipRestrictionKey(const std::string& ip) {
+    const auto pattern = ipv4SubnetPattern(ip);
+    return pattern.value_or(ip);
+}
+
 } // namespace
 
 std::ofstream faucetHelper::logger("beldex-faucet.log", std::ios::app);
@@ -60,21 +69,25 @@ std::ofstream faucetHelper::logger("beldex-faucet.log", std::ios::app);
 faucetHelper::faucetHelper() {
     try {
         const char* amountEnv = std::getenv("FAUCET_AMOUNT");
-        if (!amountEnv) {
+        if (!amountEnv || amountEnv[0] == '\0') {
             logger << "[ERROR] FAUCET_AMOUNT environment variable is not set. Set it in your .env file." << std::endl;
             throw std::runtime_error("FAUCET_AMOUNT is not configured");
         }
-        AMOUNT = std::stoll(amountEnv);
+        std::size_t amount_length = 0;
+        AMOUNT = std::stoll(amountEnv, &amount_length);
+        if (amount_length != std::string(amountEnv).size() || AMOUNT <= 0) {
+            throw std::runtime_error("FAUCET_AMOUNT must be a positive integer");
+        }
 
         const char* dbEnv = std::getenv("FAUCET_DATABASE");
-        if (!dbEnv) {
+        if (!dbEnv || dbEnv[0] == '\0') {
             logger << "[ERROR] FAUCET_DATABASE environment variable is not set. Set it in your .env file." << std::endl;
             throw std::runtime_error("FAUCET_DATABASE is not configured");
         }
         DATABASE = dbEnv;
 
         const char* walletUrlEnv = std::getenv("WALLET_URL");
-        if (!walletUrlEnv) {
+        if (!walletUrlEnv || walletUrlEnv[0] == '\0') {
             logger << "[ERROR] WALLET_URL environment variable is not set. Set it in your .env file." << std::endl;
             throw std::runtime_error("WALLET_URL is not configured");
         }
@@ -107,6 +120,28 @@ faucetHelper::faucetHelper() {
             logger << "[ERROR] Error creating table: "<< tableerr <<  std::endl;
             sqlite3_free(tableerr);
             throw std::runtime_error("Failed to create users table");
+        }
+
+        // This table prevents concurrent payouts without writing incomplete
+        // or failed transfers to the users transaction history.
+        const char* create_address_locks =
+            "CREATE TABLE IF NOT EXISTS faucet_address_locks ("
+            "Tx_Address TEXT PRIMARY KEY, "
+            "ReservedAt INTEGER NOT NULL);";
+        if (sqlite3_exec(db, create_address_locks, nullptr, nullptr, &tableerr) != SQLITE_OK) {
+            logger << "[ERROR] Error creating address lock table: " << tableerr << std::endl;
+            sqlite3_free(tableerr);
+            throw std::runtime_error("Failed to create address lock table");
+        }
+
+        const char* create_ip_locks =
+            "CREATE TABLE IF NOT EXISTS faucet_ip_locks ("
+            "IP_Key TEXT PRIMARY KEY, "
+            "ReservedAt INTEGER NOT NULL);";
+        if (sqlite3_exec(db, create_ip_locks, nullptr, nullptr, &tableerr) != SQLITE_OK) {
+            logger << "[ERROR] Error creating IP lock table: " << tableerr << std::endl;
+            sqlite3_free(tableerr);
+            throw std::runtime_error("Failed to create IP lock table");
         }
 
         const char* create_address_index =
@@ -148,22 +183,25 @@ faucetHelper::~faucetHelper() {
 // Validate client testnet address
 bool faucetHelper::validateTestnetAddress(std::string tnAddr) {
     try {
-        std::string payload = fmt::format(
-            R"({{
-                "jsonrpc":"2.0",
-                "id":"0",
-                "method":"validate_address",
-                "params":{{
-                    "address":"{}",
-                    "any_net_type":true
-                }}
-            }})", 
-            tnAddr
-        );
+        const nl::json request_payload = {
+            {"jsonrpc", "2.0"},
+            {"id", "0"},
+            {"method", "validate_address"},
+            {"params", {
+                {"address", tnAddr},
+                {"any_net_type", true}
+            }}
+        };
+        const std::string payload = request_payload.dump();
 
         std::cout << "Wallet Url : " << WALLET_URL << std::endl;
         cpr::Header headers = cpr::Header{std::make_pair("Content-Type", "application/json")};
-        cpr::Response res = cpr::Post(cpr::Url{WALLET_URL}, headers, cpr::Body{payload});
+        cpr::Response res = cpr::Post(
+            cpr::Url{WALLET_URL},
+            headers,
+            cpr::Body{payload},
+            cpr::ConnectTimeout{wallet_connect_timeout_ms},
+            cpr::Timeout{wallet_request_timeout_ms});
 
         std::cout << "Status Code: " << res.status_code << std::endl;
         std::cout << "Response Text: " << res.text << std::endl;
@@ -218,10 +256,18 @@ std::string faucetHelper::getClientIP(const crow::request& req) {
             return value.substr(first, last - first + 1);
         };
 
-        // Cloudflare sets this header to the original visitor's IP address.
-        std::string clientIP = trim(req.get_header_value("CF-Connecting-IP"));
+        const std::string remoteIP = trim(req.remote_ip_address);
+        const bool fromTrustedLocalProxy =
+            remoteIP == "127.0.0.1" || remoteIP == "::1";
 
-        if (clientIP.empty()) {
+        // Only trust proxy-provided headers when the direct peer is the local
+        // reverse proxy. Otherwise a client could forge its rate-limit key.
+        std::string clientIP;
+        if (fromTrustedLocalProxy) {
+            clientIP = trim(req.get_header_value("CF-Connecting-IP"));
+        }
+
+        if (fromTrustedLocalProxy && clientIP.empty()) {
             // X-Forwarded-For is a comma-separated chain. The first entry is
             // the original client when the header is set by a trusted proxy.
             clientIP = req.get_header_value("X-Forwarded-For");
@@ -233,7 +279,7 @@ std::string faucetHelper::getClientIP(const crow::request& req) {
         }
 
         if (clientIP.empty()) {
-            clientIP = trim(req.remote_ip_address);
+            clientIP = remoteIP;
         }
 
         return clientIP;
@@ -468,22 +514,18 @@ RpcReturnType faucetHelper::transferRequest(std::string tnAddr, std::string clie
     crow::json::wvalue transRes;
 
     try {
-        std::string payload = fmt::format(R"({{
-            "jsonrpc": "2.0",
-            "id": "0",
-            "method": "transfer",
-            "params": {{
-                "destinations": [
-                    {{
-                        "amount": {},
-                        "address": "{}"
-                    }}
-                ],
-                "account_index": 0,
-                "priority": 0,
-                "get_tx_key": true
+        const nl::json request_payload = {
+            {"jsonrpc", "2.0"},
+            {"id", "0"},
+            {"method", "transfer"},
+            {"params", {
+                {"destinations", {{{"amount", AMOUNT}, {"address", tnAddr}}}},
+                {"account_index", 0},
+                {"priority", 1},
+                {"get_tx_key", true}
             }}
-        }})", AMOUNT, tnAddr);
+        };
+        const std::string payload = request_payload.dump();
 
 
         char* transaction_error = nullptr;
@@ -505,23 +547,31 @@ RpcReturnType faucetHelper::transferRequest(std::string tnAddr, std::string clie
             }
         };
 
-        ReturnType result = faucetHelper::isAddressRestrict(tnAddr);
-        auto [response, is_restricted, statuscode] = result;
-
-        if (is_restricted) {
+        ReturnType ip_result = faucetHelper::isIpRestrict(clientIP);
+        auto [ip_response, is_ip_restricted, ip_statuscode] = ip_result;
+        if (is_ip_restricted) {
             rollback_reservation();
-            return {response, statuscode};
+            return {ip_response, ip_statuscode};
         }
 
-        // Insert the restriction before sending funds. BEGIN IMMEDIATE makes
-        // the check-and-insert atomic across threads and service processes.
-        const std::string timestamp = std::to_string(std::time(nullptr));
-        const char* insert_user =
-            "INSERT INTO users (Tx_Address, Tx_Amount, IP, Timestamp) VALUES (?, ?, ?, ?);";
-        sqlite3_stmt* reservation_stmt = nullptr;
+        ReturnType address_result = faucetHelper::isAddressRestrict(tnAddr);
+        auto [address_response, is_address_restricted, address_statuscode] = address_result;
+        if (is_address_restricted) {
+            rollback_reservation();
+            return {address_response, address_statuscode};
+        }
 
-        if (sqlite3_prepare_v2(db, insert_user, -1, &reservation_stmt, nullptr) != SQLITE_OK) {
-            logger << "[ERROR] Failed to prepare address reservation: "
+        // Remove a stale lock for this address. A retained lock protects
+        // against retrying an ambiguous wallet response for 24 hours.
+        constexpr sqlite3_int64 lock_lifetime_seconds = 24LL * 60 * 60;
+        const sqlite3_int64 reserved_at = static_cast<sqlite3_int64>(std::time(nullptr));
+        const std::string ip_key = ipRestrictionKey(clientIP);
+        sqlite3_stmt* stale_lock_stmt = nullptr;
+        const char* delete_stale_lock =
+            "DELETE FROM faucet_address_locks "
+            "WHERE Tx_Address = ? AND ReservedAt <= ?;";
+        if (sqlite3_prepare_v2(db, delete_stale_lock, -1, &stale_lock_stmt, nullptr) != SQLITE_OK) {
+            logger << "[ERROR] Failed to prepare stale address lock cleanup: "
                    << sqlite3_errmsg(db) << std::endl;
             rollback_reservation();
             transRes["tx-error"] = "Something went wrong.";
@@ -529,17 +579,97 @@ RpcReturnType faucetHelper::transferRequest(std::string tnAddr, std::string clie
             return {transRes, 500};
         }
 
-        const bool bindings_ok =
-            sqlite3_bind_text(reservation_stmt, 1, tnAddr.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK &&
-            sqlite3_bind_int64(reservation_stmt, 2, AMOUNT / 1000000000) == SQLITE_OK &&
-            sqlite3_bind_text(reservation_stmt, 3, clientIP.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK &&
-            sqlite3_bind_text(reservation_stmt, 4, timestamp.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK;
+        const bool stale_lock_bindings_ok =
+            sqlite3_bind_text(stale_lock_stmt, 1, tnAddr.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_bind_int64(stale_lock_stmt, 2, reserved_at - lock_lifetime_seconds) == SQLITE_OK;
+        const int stale_lock_rc = stale_lock_bindings_ok
+            ? sqlite3_step(stale_lock_stmt)
+            : SQLITE_ERROR;
+        sqlite3_finalize(stale_lock_stmt);
 
-        const int reservation_rc = bindings_ok ? sqlite3_step(reservation_stmt) : SQLITE_ERROR;
+        if (!stale_lock_bindings_ok || stale_lock_rc != SQLITE_DONE) {
+            logger << "[ERROR] Failed to remove stale address lock: "
+                   << sqlite3_errmsg(db) << std::endl;
+            rollback_reservation();
+            transRes["tx-error"] = "Something went wrong.";
+            transRes["status"] = false;
+            return {transRes, 500};
+        }
+
+        sqlite3_stmt* stale_ip_lock_stmt = nullptr;
+        const char* delete_stale_ip_lock =
+            "DELETE FROM faucet_ip_locks "
+            "WHERE IP_Key = ? AND ReservedAt <= ?;";
+        if (sqlite3_prepare_v2(db, delete_stale_ip_lock, -1,
+                              &stale_ip_lock_stmt, nullptr) != SQLITE_OK) {
+            logger << "[ERROR] Failed to prepare stale IP lock cleanup: "
+                   << sqlite3_errmsg(db) << std::endl;
+            rollback_reservation();
+            transRes["tx-error"] = "Something went wrong.";
+            transRes["status"] = false;
+            return {transRes, 500};
+        }
+
+        const bool stale_ip_lock_bindings_ok =
+            sqlite3_bind_text(stale_ip_lock_stmt, 1, ip_key.c_str(), -1,
+                              SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_bind_int64(stale_ip_lock_stmt, 2,
+                               reserved_at - lock_lifetime_seconds) == SQLITE_OK;
+        const int stale_ip_lock_rc = stale_ip_lock_bindings_ok
+            ? sqlite3_step(stale_ip_lock_stmt)
+            : SQLITE_ERROR;
+        sqlite3_finalize(stale_ip_lock_stmt);
+
+        if (!stale_ip_lock_bindings_ok || stale_ip_lock_rc != SQLITE_DONE) {
+            logger << "[ERROR] Failed to remove stale IP lock: "
+                   << sqlite3_errmsg(db) << std::endl;
+            rollback_reservation();
+            transRes["tx-error"] = "Something went wrong.";
+            transRes["status"] = false;
+            return {transRes, 500};
+        }
+
+        // The primary key makes this an atomic cross-thread/process lock.
+        sqlite3_stmt* reservation_stmt = nullptr;
+        const char* insert_lock =
+            "INSERT INTO faucet_address_locks (Tx_Address, ReservedAt) VALUES (?, ?);";
+        if (sqlite3_prepare_v2(db, insert_lock, -1, &reservation_stmt, nullptr) != SQLITE_OK) {
+            logger << "[ERROR] Failed to prepare address lock: "
+                   << sqlite3_errmsg(db) << std::endl;
+            rollback_reservation();
+            transRes["tx-error"] = "Something went wrong.";
+            transRes["status"] = false;
+            return {transRes, 500};
+        }
+
+        const bool reservation_bindings_ok =
+            sqlite3_bind_text(reservation_stmt, 1, tnAddr.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_bind_int64(reservation_stmt, 2, reserved_at) == SQLITE_OK;
+        const int reservation_rc = reservation_bindings_ok
+            ? sqlite3_step(reservation_stmt)
+            : SQLITE_ERROR;
         sqlite3_finalize(reservation_stmt);
 
-        if (!bindings_ok || reservation_rc != SQLITE_DONE) {
-            logger << "[ERROR] Failed to save address reservation: "
+        if (!reservation_bindings_ok || reservation_rc != SQLITE_DONE) {
+            const bool already_processing = reservation_rc == SQLITE_CONSTRAINT;
+            if (!already_processing) {
+                logger << "[ERROR] Failed to acquire address lock: "
+                       << sqlite3_errmsg(db) << std::endl;
+            }
+            rollback_reservation();
+            transRes[already_processing ? "error" : "tx-error"] = already_processing
+                ? "A transaction for this address is already being processed. Please try again later."
+                : "Something went wrong.";
+            transRes["status"] = false;
+            return {transRes, already_processing ? 429 : 500};
+        }
+
+        sqlite3_stmt* ip_reservation_stmt = nullptr;
+        const char* insert_ip_lock =
+            "INSERT INTO faucet_ip_locks (IP_Key, ReservedAt) VALUES (?, ?);";
+        if (sqlite3_prepare_v2(db, insert_ip_lock, -1,
+                              &ip_reservation_stmt, nullptr) != SQLITE_OK) {
+            logger << "[ERROR] Failed to prepare IP lock: "
                    << sqlite3_errmsg(db) << std::endl;
             rollback_reservation();
             transRes["tx-error"] = "Something went wrong.";
@@ -547,10 +677,33 @@ RpcReturnType faucetHelper::transferRequest(std::string tnAddr, std::string clie
             return {transRes, 500};
         }
 
-        const sqlite3_int64 reservation_id = sqlite3_last_insert_rowid(db);
+        const bool ip_reservation_bindings_ok =
+            sqlite3_bind_text(ip_reservation_stmt, 1, ip_key.c_str(), -1,
+                              SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_bind_int64(ip_reservation_stmt, 2, reserved_at) == SQLITE_OK;
+        const int ip_reservation_rc = ip_reservation_bindings_ok
+            ? sqlite3_step(ip_reservation_stmt)
+            : SQLITE_ERROR;
+        sqlite3_finalize(ip_reservation_stmt);
+
+        if (!ip_reservation_bindings_ok || ip_reservation_rc != SQLITE_DONE) {
+            const bool ip_already_processing = ip_reservation_rc == SQLITE_CONSTRAINT;
+            if (!ip_already_processing) {
+                logger << "[ERROR] Failed to acquire IP lock: "
+                       << sqlite3_errmsg(db) << std::endl;
+            }
+            rollback_reservation();
+            transRes[ip_already_processing ? "error" : "tx-error"] =
+                ip_already_processing
+                    ? "A transaction from this network is already being processed. Please try again later."
+                    : "Something went wrong.";
+            transRes["status"] = false;
+            return {transRes, ip_already_processing ? 429 : 500};
+        }
+
         transaction_error = nullptr;
         if (sqlite3_exec(db, "COMMIT;", nullptr, nullptr, &transaction_error) != SQLITE_OK) {
-            logger << "[ERROR] Failed to commit address reservation: "
+            logger << "[ERROR] Failed to commit address lock: "
                    << (transaction_error ? transaction_error : sqlite3_errmsg(db)) << std::endl;
             sqlite3_free(transaction_error);
             rollback_reservation();
@@ -559,25 +712,170 @@ RpcReturnType faucetHelper::transferRequest(std::string tnAddr, std::string clie
             return {transRes, 500};
         }
 
-        auto release_reservation = [this, reservation_id]() {
-            sqlite3_stmt* delete_stmt = nullptr;
-            const char* delete_sql = "DELETE FROM users WHERE Tx_Id = ?;";
-            if (sqlite3_prepare_v2(db, delete_sql, -1, &delete_stmt, nullptr) != SQLITE_OK) {
-                logger << "[ERROR] Failed to prepare reservation cleanup: "
-                       << sqlite3_errmsg(db) << std::endl;
+        auto release_reservation = [this, &tnAddr, &ip_key]() {
+            char* cleanup_error = nullptr;
+            if (sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr,
+                             &cleanup_error) != SQLITE_OK) {
+                logger << "[ERROR] Failed to begin lock cleanup: "
+                       << (cleanup_error ? cleanup_error : sqlite3_errmsg(db))
+                       << std::endl;
+                sqlite3_free(cleanup_error);
                 return false;
             }
 
-            const bool bind_ok =
-                sqlite3_bind_int64(delete_stmt, 1, reservation_id) == SQLITE_OK;
-            const int delete_rc = bind_ok ? sqlite3_step(delete_stmt) : SQLITE_ERROR;
+            auto rollback_cleanup = [this]() {
+                sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+            };
+
+            auto delete_lock = [this](const char* sql, const std::string& value) {
+                sqlite3_stmt* stmt = nullptr;
+                if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+                    return false;
+                }
+                const bool bind_ok =
+                    sqlite3_bind_text(stmt, 1, value.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK;
+                const int step_rc = bind_ok ? sqlite3_step(stmt) : SQLITE_ERROR;
+                sqlite3_finalize(stmt);
+                return bind_ok && step_rc == SQLITE_DONE;
+            };
+
+            if (!delete_lock(
+                    "DELETE FROM faucet_address_locks WHERE Tx_Address = ?;", tnAddr) ||
+                !delete_lock(
+                    "DELETE FROM faucet_ip_locks WHERE IP_Key = ?;", ip_key)) {
+                logger << "[ERROR] Failed to clean up faucet locks: "
+                       << sqlite3_errmsg(db) << std::endl;
+                rollback_cleanup();
+                return false;
+            }
+
+            cleanup_error = nullptr;
+            if (sqlite3_exec(db, "COMMIT;", nullptr, nullptr, &cleanup_error) != SQLITE_OK) {
+                logger << "[ERROR] Failed to commit faucet lock cleanup: "
+                       << (cleanup_error ? cleanup_error : sqlite3_errmsg(db))
+                       << std::endl;
+                sqlite3_free(cleanup_error);
+                rollback_cleanup();
+                return false;
+            }
+            return true;
+        };
+
+        auto record_successful_transfer = [this, &tnAddr, &clientIP, &ip_key]() {
+            char* success_transaction_error = nullptr;
+            if (sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr,
+                             &success_transaction_error) != SQLITE_OK) {
+                logger << "[ERROR] Failed to begin successful transfer transaction: "
+                       << (success_transaction_error
+                               ? success_transaction_error
+                               : sqlite3_errmsg(db))
+                       << std::endl;
+                sqlite3_free(success_transaction_error);
+                return false;
+            }
+
+            auto rollback_success = [this]() {
+                char* rollback_error = nullptr;
+                if (sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, &rollback_error) != SQLITE_OK) {
+                    logger << "[ERROR] Failed to roll back successful transfer record: "
+                           << (rollback_error ? rollback_error : sqlite3_errmsg(db))
+                           << std::endl;
+                    sqlite3_free(rollback_error);
+                }
+            };
+
+            const std::string completed_at = std::to_string(std::time(nullptr));
+            const char* insert_user =
+                "INSERT INTO users (Tx_Address, Tx_Amount, IP, Timestamp) "
+                "VALUES (?, ?, ?, ?);";
+            sqlite3_stmt* insert_stmt = nullptr;
+            if (sqlite3_prepare_v2(db, insert_user, -1, &insert_stmt, nullptr) != SQLITE_OK) {
+                logger << "[ERROR] Failed to prepare successful transfer record: "
+                       << sqlite3_errmsg(db) << std::endl;
+                rollback_success();
+                return false;
+            }
+
+            const bool insert_bindings_ok =
+                sqlite3_bind_text(insert_stmt, 1, tnAddr.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                sqlite3_bind_int64(insert_stmt, 2, AMOUNT / 1000000000) == SQLITE_OK &&
+                sqlite3_bind_text(insert_stmt, 3, clientIP.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                sqlite3_bind_text(insert_stmt, 4, completed_at.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK;
+            const int insert_rc = insert_bindings_ok
+                ? sqlite3_step(insert_stmt)
+                : SQLITE_ERROR;
+            sqlite3_finalize(insert_stmt);
+
+            if (!insert_bindings_ok || insert_rc != SQLITE_DONE) {
+                logger << "[ERROR] Failed to save successful transfer: "
+                       << sqlite3_errmsg(db) << std::endl;
+                rollback_success();
+                return false;
+            }
+
+            const char* delete_lock =
+                "DELETE FROM faucet_address_locks WHERE Tx_Address = ?;";
+            sqlite3_stmt* delete_stmt = nullptr;
+            if (sqlite3_prepare_v2(db, delete_lock, -1, &delete_stmt, nullptr) != SQLITE_OK) {
+                logger << "[ERROR] Failed to prepare successful address lock cleanup: "
+                       << sqlite3_errmsg(db) << std::endl;
+                rollback_success();
+                return false;
+            }
+
+            const bool delete_binding_ok =
+                sqlite3_bind_text(delete_stmt, 1, tnAddr.c_str(), -1, SQLITE_TRANSIENT) == SQLITE_OK;
+            const int delete_rc = delete_binding_ok
+                ? sqlite3_step(delete_stmt)
+                : SQLITE_ERROR;
             sqlite3_finalize(delete_stmt);
 
-            if (!bind_ok || delete_rc != SQLITE_DONE) {
-                logger << "[ERROR] Failed to clean up address reservation: "
+            if (!delete_binding_ok || delete_rc != SQLITE_DONE) {
+                logger << "[ERROR] Failed to remove successful address lock: "
                        << sqlite3_errmsg(db) << std::endl;
+                rollback_success();
                 return false;
             }
+
+            const char* delete_ip_lock =
+                "DELETE FROM faucet_ip_locks WHERE IP_Key = ?;";
+            sqlite3_stmt* delete_ip_stmt = nullptr;
+            if (sqlite3_prepare_v2(db, delete_ip_lock, -1,
+                                  &delete_ip_stmt, nullptr) != SQLITE_OK) {
+                logger << "[ERROR] Failed to prepare successful IP lock cleanup: "
+                       << sqlite3_errmsg(db) << std::endl;
+                rollback_success();
+                return false;
+            }
+
+            const bool delete_ip_binding_ok =
+                sqlite3_bind_text(delete_ip_stmt, 1, ip_key.c_str(), -1,
+                                  SQLITE_TRANSIENT) == SQLITE_OK;
+            const int delete_ip_rc = delete_ip_binding_ok
+                ? sqlite3_step(delete_ip_stmt)
+                : SQLITE_ERROR;
+            sqlite3_finalize(delete_ip_stmt);
+
+            if (!delete_ip_binding_ok || delete_ip_rc != SQLITE_DONE) {
+                logger << "[ERROR] Failed to remove successful IP lock: "
+                       << sqlite3_errmsg(db) << std::endl;
+                rollback_success();
+                return false;
+            }
+
+            success_transaction_error = nullptr;
+            if (sqlite3_exec(db, "COMMIT;", nullptr, nullptr,
+                             &success_transaction_error) != SQLITE_OK) {
+                logger << "[ERROR] Failed to commit successful transfer record: "
+                       << (success_transaction_error
+                               ? success_transaction_error
+                               : sqlite3_errmsg(db))
+                       << std::endl;
+                sqlite3_free(success_transaction_error);
+                rollback_success();
+                return false;
+            }
+
             return true;
         };
 
@@ -585,11 +883,15 @@ RpcReturnType faucetHelper::transferRequest(std::string tnAddr, std::string clie
             try {
                 std::cout << "Wallet Url : " << WALLET_URL << std::endl;
                 cpr::Header headers = cpr::Header{std::make_pair("Content-Type", "application/json")};
-                cpr::Response res = cpr::Post(cpr::Url{WALLET_URL}, headers, cpr::Body{payload});
+                cpr::Response res = cpr::Post(
+                    cpr::Url{WALLET_URL},
+                    headers,
+                    cpr::Body{payload},
+                    cpr::ConnectTimeout{wallet_connect_timeout_ms});
 
                 if (res.error) {
                     logger << "[ERROR] HTTP request failed While Transfer: " << res.error.message << std::endl;
-                    logger << "[WARN] Address reservation retained because the transfer result is ambiguous." << std::endl;
+                    logger << "[WARN] Faucet locks retained because the transfer result is ambiguous." << std::endl;
                     transRes["error"] = "Something went wrong.";
                     transRes["status"] = false;
                     return {transRes, 500};
@@ -629,16 +931,41 @@ RpcReturnType faucetHelper::transferRequest(std::string tnAddr, std::string clie
                 }
 
                 std::string tx_hash = rpc_result["result"]["tx_hash"];
+                if (tx_hash.empty()) {
+                    throw std::runtime_error("Wallet returned an empty transaction hash");
+                }
+
+                bool transfer_recorded = false;
+                for (int database_attempt = 0; database_attempt < 3; ++database_attempt) {
+                    if (record_successful_transfer()) {
+                        transfer_recorded = true;
+                        break;
+                    }
+                    if (database_attempt < 2) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                }
+
+                if (!transfer_recorded) {
+                    // Funds were sent, so return the confirmed transaction to
+                    // the client. Retained locks prevent an unsafe retry.
+                    logger << "[CRITICAL] Transfer " << tx_hash
+                           << " succeeded but could not be written to users; "
+                           << "the faucet locks were retained." << std::endl;
+                    transRes["warning"] =
+                        "Funds were sent, but transaction history recording requires administrator attention.";
+                }
 
                 transRes["tx_hash"] = tx_hash;
                 transRes["amount"] = AMOUNT / 1000000000;
+                transRes["recorded"] = transfer_recorded;
                 transRes["status"] = true;
 
                 return {transRes, 200};
             } catch (const std::exception& e) {
                 logger << "[EXCEPTION] Exception while processing transfer response: "
                        << e.what() << std::endl;
-                logger << "[WARN] Address reservation retained because the transfer result is ambiguous." << std::endl;
+                logger << "[WARN] Faucet locks retained because the transfer result is ambiguous." << std::endl;
                 transRes["message"] = "The transfer result could not be confirmed.";
                 transRes["status"] = false;
                 return {transRes, 500};

@@ -2,6 +2,16 @@ const statusWrap = () => document.getElementById('tx-status');
 const statusRow = () => document.getElementById('tx-status-row');
 const submitBtn = () => document.getElementById('submit-btn');
 
+function escapeHtml(value) {
+    return String(value).replace(/[&<>'"]/g, character => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        "'": '&#39;',
+        '"': '&quot;'
+    })[character]);
+}
+
 function setStatus(kind, html) {
     const wrap = statusWrap();
     const row = statusRow();
@@ -136,7 +146,7 @@ function submit_key() {
 
     const payload = { address: address };
 
-    fetch('http://localhost:5000/transfer', {
+    fetch('/transfer', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json'
@@ -146,21 +156,27 @@ function submit_key() {
         .then(response => response.json())
         .then(data => {
             if (data.status) {
-                setStatus('success', `Transaction successful! ${data.amount} BDX was sent. Reference: ${data.tx_hash}.`);
+                const amount = escapeHtml(data.amount);
+                const txHash = escapeHtml(data.tx_hash);
+                const txUrl = `https://testnet.beldex.dev/tx/${encodeURIComponent(String(data.tx_hash))}`;
+                const warning = data.warning
+                    ? ` ${escapeHtml(data.warning)} Do not submit the transaction again.`
+                    : '';
+                setStatus('success', `Transaction successful! ${amount} BDX was sent. Reference: ${txHash}.${warning}`);
                 setTimeout(() => {
-                    setStatus('success', `Transaction successful! ${data.amount} BDX was sent. Reference: <a href="https://testnet.beldex.dev/tx/${data.tx_hash}" target="_blank" rel="noopener noreferrer">${data.tx_hash}</a>.`);
+                    setStatus('success', `Transaction successful! ${amount} BDX was sent. Reference: <a href="${txUrl}" target="_blank" rel="noopener noreferrer">${txHash}</a>.${warning}`);
                 }, 3000);
             } else if (data['tx-error']) {
-                setStatus('error', `${data['tx-error']}. Please try again later or <a href="https://testnet.support.beldex.io" target="_blank" rel="noopener noreferrer">contact support</a>.`);
+                setStatus('error', `${escapeHtml(data['tx-error'])}. Please try again later or <a href="https://testnet.support.beldex.io" target="_blank" rel="noopener noreferrer">contact support</a>.`);
             } else if (data.error) {
-                setStatus('error', `${data.error}`);
+                setStatus('error', escapeHtml(data.error));
             } else {
                 setStatus('error', 'Unexpected response.');
             }
         })
         .catch(error => {
             console.error('Fetch error: ', error);
-            setStatus('error', `Fetch error: ${error}`);
+            setStatus('error', `Fetch error: ${escapeHtml(error)}`);
         })
         .finally(() => {
             btn.disabled = false;
