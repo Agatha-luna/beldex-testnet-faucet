@@ -61,7 +61,10 @@ as `CAPTCHA_SECRET_KEY`. Restart the backend after changing `.env`.
 
 The frontend submits `captcha_token` with `address`. The backend verifies it with
 Cloudflare before any wallet RPC or database reservation and requires the `faucet`
-action. Missing, rejected, expired or reused tokens cannot request funds; verification
+action. The backend requires Cloudflare's verified `challenge_ts` to be less than
+60 seconds old, enforcing a 1-minute limit. Missing, invalid or future timestamps
+are rejected. Keep the backend server clock synchronized.
+Missing, rejected, expired or reused tokens cannot request funds; verification
 outages also block transfers. The widget resets after each request.
 
 See https://developers.cloudflare.com/turnstile/get-started/ for key setup.

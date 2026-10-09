@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <stdexcept>
 #include <cstdint>
+#include <ctime>
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
 #include <fmt/core.h>
@@ -20,6 +21,43 @@ namespace {
 
 constexpr std::int32_t wallet_connect_timeout_ms = 5000;
 constexpr std::int32_t wallet_request_timeout_ms = 30000;
+constexpr auto captcha_max_age = std::chrono::seconds{60};
+
+bool captchaTimestampIsFresh(const std::string& timestamp,
+                             std::chrono::system_clock::time_point now) {
+    // Cloudflare's verified ISO 8601 UTC timestamp may include fractions.
+    if (timestamp.size() < 20 || timestamp.back() != 'Z') {
+        return false;
+    }
+    std::tm challenge_tm{};
+    std::istringstream input(timestamp.substr(0, 19));
+    input >> std::get_time(&challenge_tm, "%Y-%m-%dT%H:%M:%S");
+    if (input.fail() || input.peek() != std::char_traits<char>::eof()) {
+        return false;
+    }
+    double fraction = 0;
+    if (timestamp.size() != 20) {
+        if (timestamp[19] != '.' || timestamp.size() < 22 ||
+            timestamp.find_first_not_of("0123456789", 20) != timestamp.size() - 1) {
+            return false;
+        }
+        fraction = std::stod("0" + timestamp.substr(19, timestamp.size() - 20));
+    }
+    const auto seconds = timegm(&challenge_tm);
+    if (seconds == -1) {
+        return false;
+    }
+    // Reject invalid dates that timegm silently normalizes.
+    std::ostringstream normalized;
+    normalized << std::put_time(&challenge_tm, "%Y-%m-%dT%H:%M:%S");
+    if (normalized.str() != timestamp.substr(0, 19)) {
+        return false;
+    }
+    const auto challenge_time = std::chrono::system_clock::from_time_t(seconds) +
+        std::chrono::duration_cast<std::chrono::system_clock::duration>(
+            std::chrono::duration<double>{fraction});
+    return challenge_time <= now && now - challenge_time < captcha_max_age;
+}
 
 std::optional<std::string> ipv4SubnetPattern(const std::string& ip) {
     std::size_t start = 0;
@@ -91,6 +129,12 @@ RpcReturnType faucetHelper::verifyCaptcha(const std::string& token) {
         const auto verified = nl::json::parse(result.text);
         if (!verified.value("success", false) || verified.value("action", "") != "faucet") {
             response["error"] = "CAPTCHA verification failed. Please complete a new challenge.";
+            return {response, 403};
+        }
+        if (!verified.contains("challenge_ts") || !verified["challenge_ts"].is_string() ||
+            !captchaTimestampIsFresh(verified["challenge_ts"].get<std::string>(),
+                                     std::chrono::system_clock::now())) {
+            response["error"] = "CAPTCHA expired or its timestamp is invalid. Complete a new challenge and submit within 1 minute.";
             return {response, 403};
         }
         response["status"] = true;
