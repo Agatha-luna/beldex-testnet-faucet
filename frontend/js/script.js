@@ -187,12 +187,18 @@ async function connectWallet() {
     }
 }
 
-function submit_key() {
+async function submit_key() {
     if (submitBtn().disabled) return;
+
     const address = connectedAddress.trim();
 
     if (!address) {
         setStatus('error', 'Please connect your Beldex Wallet first.');
+        return;
+    }
+
+    if (!bdxWallet || !bdxWallet.isConnected) {
+        setStatus('error', 'Your Beldex Wallet disconnected. Please connect again.');
         return;
     }
 
@@ -209,57 +215,102 @@ function submit_key() {
 
     const btn = submitBtn();
     btn.disabled = true;
-    btn.textContent = 'Sending...';
-    setStatus('pending', 'Your request is being processed. Please stand by...');
 
-    const payload = { address: address, captcha_token: captchaToken };
-    captchaToken = '';
+    try {
+        btn.textContent = 'Requesting challenge...';
+        setStatus('pending', 'Preparing a wallet-ownership proof. Please stand by...');
 
-    fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-    })
-        .then(async response => {
-            const text = await response.text();
-            try {
-                return JSON.parse(text);
-            } catch {
-                throw new Error(`The faucet API returned a non-JSON response (HTTP ${response.status}) from ${apiUrl}. The request could not be confirmed. Please contact support.`);
-            }
-        })
-        .then(data => {
-            if (!data || typeof data !== 'object' || Array.isArray(data)) {
-                throw new Error('The faucet API returned an invalid response.');
-            }
-            if (data.status === true) {
-                const amount = escapeHtml(data.amount);
-                const txHash = escapeHtml(data.tx_hash);
-                const txUrl = `https://testnet.beldex.dev/tx/${encodeURIComponent(String(data.tx_hash))}`;
-                const warning = data.warning
-                    ? ` ${escapeHtml(data.warning)} Do not submit the transaction again.`
-                    : '';
-                setStatus('success', `Transaction successful! ${amount} BDX was sent. Reference: ${txHash}.${warning}`);
-                setTimeout(() => {
-                    setStatus('success', `Transaction successful! ${amount} BDX was sent. Reference: <a href="${txUrl}" target="_blank" rel="noopener noreferrer">${txHash}</a>.${warning}`);
-                }, 3000);
-            } else if (data['tx-error']) {
-                setStatus('error', `${escapeHtml(data['tx-error'])}. Please try again later or <a href="https://testnet.support.beldex.io" target="_blank" rel="noopener noreferrer">contact support</a>.`);
-            } else if (data.error) {
-                setStatus('error', escapeHtml(data.error));
+        const challengeUrl = new URL(apiUrl, window.location.href);
+        challengeUrl.pathname = challengeUrl.pathname.replace(/\/transfer\/?$/, '/challenge');
+        challengeUrl.search = '';
+        challengeUrl.searchParams.set('address', address);
+
+        const challengeRes = await fetch(challengeUrl.toString());
+        const challengeText = await challengeRes.text();
+        let challengeData;
+        try {
+            challengeData = JSON.parse(challengeText);
+        } catch {
+            throw new Error(`The challenge API returned a non-JSON response (HTTP ${challengeRes.status}).`);
+        }
+
+        if (!challengeRes.ok || !challengeData.challenge) {
+            setStatus('error', escapeHtml(challengeData.error || 'Could not get a signing challenge from the faucet.'));
+            return;
+        }
+
+        btn.textContent = 'Waiting for signature...';
+        setStatus('pending', 'Please approve the signature request in your Beldex Wallet...');
+
+        let signature;
+        try {
+            ({ signature } = await bdxWallet.signMessage(challengeData.challenge));
+        } catch (err) {
+            console.error('Sign message error:', err);
+            if (BdxWeb3.BdxRpcError.isLocked(err)) {
+                setStatus('error', 'Your Beldex Wallet is locked. Unlock the extension and try again.');
+            } else if (BdxWeb3.BdxRpcError.isUserRejection(err)) {
+                setStatus('error', 'Signature request was rejected.');
+            } else if (err.code === 4902) { // ERR.PANEL_CLOSED — wallet's side panel isn't open
+                setStatus('error', escapeHtml(err.message));
             } else {
-                setStatus('error', 'Unexpected response.');
+                setStatus('error', `Could not sign the ownership proof: ${escapeHtml(err.message || err)}`);
             }
-        })
-        .catch(error => {
-            console.error('Fetch error: ', error);
-            setStatus('error', escapeHtml(error.message || error));
-        })
-        .finally(() => {
-            resetCaptcha();
-            btn.disabled = false;
-            btn.textContent = 'Get Faucet';
+            return;
+        }
+
+        btn.textContent = 'Sending...';
+        setStatus('pending', 'Your request is being processed. Please stand by...');
+
+        const payload = {
+            address,
+            captcha_token: captchaToken,
+            challenge: challengeData.challenge,
+            signature
+        };
+        captchaToken = '';
+
+        const response = await fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
         });
+        const responseText = await response.text();
+        let data;
+        try {
+            data = JSON.parse(responseText);
+        } catch {
+            throw new Error(`The faucet API returned a non-JSON response (HTTP ${response.status}). The transaction could not be confirmed. Please contact support.`);
+        }
+
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            throw new Error('The faucet API returned an invalid response.');
+        }
+
+        if (data.status === true) {
+            const amount = escapeHtml(data.amount);
+            const txHash = escapeHtml(data.tx_hash);
+            const txUrl = `https://testnet.beldex.dev/tx/${encodeURIComponent(String(data.tx_hash))}`;
+            const warning = data.warning
+                ? ` ${escapeHtml(data.warning)} Do not submit the transaction again.`
+                : '';
+            setStatus('success', `Transaction successful! ${amount} BDX was sent. Reference: ${txHash}.${warning}`);
+            setTimeout(() => {
+                setStatus('success', `Transaction successful! ${amount} BDX was sent. Reference: <a href="${txUrl}" target="_blank" rel="noopener noreferrer">${txHash}</a>.${warning}`);
+            }, 3000);
+        } else if (data['tx-error']) {
+            setStatus('error', `${escapeHtml(data['tx-error'])}. Please try again later or <a href="https://testnet.support.beldex.io" target="_blank" rel="noopener noreferrer">contact support</a>.`);
+        } else if (data.error) {
+            setStatus('error', escapeHtml(data.error));
+        } else {
+            setStatus('error', 'Unexpected response.');
+        }
+    } catch (error) {
+        console.error('Fetch error: ', error);
+        setStatus('error', escapeHtml(error.message || error));
+    } finally {
+        resetCaptcha();
+        btn.disabled = false;
+        btn.textContent = 'Get Faucet';
+    }
 }

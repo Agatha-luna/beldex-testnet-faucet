@@ -12,6 +12,10 @@
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
 #include <fmt/core.h>
+#include <openssl/hmac.h>
+#include <openssl/rand.h>
+#include <openssl/crypto.h>
+#include <vector>
 
 using ReturnType = std::tuple<crow::json::wvalue, bool, int>;
 using RpcReturnType = std::tuple<crow::json::wvalue, int>;
@@ -172,6 +176,12 @@ faucetHelper::faucetHelper() {
             throw std::runtime_error("WALLET_URL is not configured");
         }
         WALLET_URL = walletUrlEnv;
+
+        const char* signSecretEnv = std::getenv("FAUCET_SIGN_SECRET");
+        if (!signSecretEnv) {
+            logger << "[ERROR] FAUCET_SIGN_SECRET environment variable is not set. Set it in your .env file." << std::endl;
+        }
+        SIGN_SECRET = signSecretEnv ? signSecretEnv : "";
 
         if (!logger.is_open()) {
             std::cerr << "[ERROR] Cannot open log file." << std::endl;
@@ -386,6 +396,35 @@ std::chrono::system_clock::time_point parseTimestamp(const std::string& timestam
     std::istringstream ss(timestamp);
     ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
     return std::chrono::system_clock::from_time_t(std::mktime(&tm));
+}
+
+
+// Hex-encoded HMAC-SHA256
+std::string hmacHex(const std::string& key, const std::string& data) {
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
+         reinterpret_cast<const unsigned char*>(data.data()), data.size(),
+         digest, &len);
+
+    std::ostringstream oss;
+    for (unsigned int i = 0; i < len; ++i) {
+        oss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(digest[i]);
+    }
+    return oss.str();
+}
+
+
+// Random hex nonce
+std::string randomHex(size_t numBytes) {
+    std::vector<unsigned char> buf(numBytes);
+    RAND_bytes(buf.data(), static_cast<int>(buf.size()));
+
+    std::ostringstream oss;
+    for (unsigned char b : buf) {
+        oss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(b);
+    }
+    return oss.str();
 }
 
 
@@ -1062,4 +1101,133 @@ RpcReturnType faucetHelper::transferRequest(std::string tnAddr, std::string clie
     transRes["status"] = false;
     return {transRes, 500};
 
+}
+
+
+namespace {
+    constexpr const char* CHALLENGE_PREFIX = "beldex-faucet-auth";
+    constexpr const char* CHALLENGE_VERSION = "v1";
+    constexpr int64_t CHALLENGE_TTL_SECONDS = 300;   // 5 minutes to connect, sign and submit
+    constexpr int64_t CHALLENGE_CLOCK_SKEW_SECONDS = 60;
+
+    // Same string the HMAC is computed over for a given (address, issued, nonce) triple.
+    std::string challengeSigningInput(const std::string& address, const std::string& issued, const std::string& nonce) {
+        return std::string(CHALLENGE_PREFIX) + "|" + CHALLENGE_VERSION + "|" + address + "|" + issued + "|" + nonce;
+    }
+
+    bool constantTimeEquals(const std::string& a, const std::string& b) {
+        if (a.size() != b.size()) return false;
+        return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
+    }
+
+    std::vector<std::string> splitPipe(const std::string& s) {
+        std::vector<std::string> parts;
+        std::stringstream ss(s);
+        std::string part;
+        while (std::getline(ss, part, '|')) parts.push_back(part);
+        return parts;
+    }
+}
+
+// Mint a short-lived, address-bound challenge for the client to sign with its
+// wallet. The address isn't embedded verbatim — the HMAC is computed over it,
+// so checkChallenge() just needs to recompute it with whatever address the
+// caller claims and compare; a challenge issued for one address won't verify
+// against a different one.
+std::string faucetHelper::makeChallenge(const std::string& address) {
+    std::string issued = std::to_string(static_cast<int64_t>(std::time(nullptr)));
+    std::string nonce = randomHex(4);
+    std::string mac = hmacHex(SIGN_SECRET, challengeSigningInput(address, issued, nonce));
+
+    return std::string(CHALLENGE_PREFIX) + "|" + CHALLENGE_VERSION + "|" + issued + "|" + nonce + "|" + mac;
+}
+
+// Validate a challenge's shape, freshness, and that it was actually minted for
+// `address` (via the HMAC) — not just any well-formed-looking challenge.
+bool faucetHelper::checkChallenge(const std::string& challenge, const std::string& address, std::string& error) {
+    try {
+        std::vector<std::string> parts = splitPipe(challenge);
+        if (parts.size() != 5 || parts[0] != CHALLENGE_PREFIX || parts[1] != CHALLENGE_VERSION) {
+            error = "Invalid or missing signing challenge. Please connect your wallet and try again.";
+            return false;
+        }
+
+        const std::string& issued = parts[2];
+        const std::string& nonce = parts[3];
+        const std::string& providedMac = parts[4];
+
+        int64_t issuedAt;
+        try {
+            issuedAt = std::stoll(issued);
+        } catch (const std::exception&) {
+            error = "Invalid or missing signing challenge. Please connect your wallet and try again.";
+            return false;
+        }
+
+        int64_t now = static_cast<int64_t>(std::time(nullptr));
+        if (issuedAt > now + CHALLENGE_CLOCK_SKEW_SECONDS) {
+            error = "Invalid or missing signing challenge. Please connect your wallet and try again.";
+            return false;
+        }
+        if (now - issuedAt > CHALLENGE_TTL_SECONDS) {
+            error = "Signing challenge expired. Please try again.";
+            return false;
+        }
+
+        std::string expectedMac = hmacHex(SIGN_SECRET, challengeSigningInput(address, issued, nonce));
+        if (!constantTimeEquals(expectedMac, providedMac)) {
+            error = "Invalid or missing signing challenge. Please connect your wallet and try again.";
+            return false;
+        }
+
+        return true;
+    } catch (const std::exception& e) {
+        logger << "[EXCEPTION] Unexpected error in checkChallenge: " << e.what() << std::endl;
+        error = "Something went wrong.";
+        return false;
+    }
+}
+
+// Ask the wallet RPC to verify `signature` was produced by `address`'s own
+// spend key over `data` (the challenge) — the same "verify" method Beldex
+// wallet CLI/RPC has always exposed, so no signature crypto needs to be
+// reimplemented here.
+bool faucetHelper::verifySignature(const std::string& address, const std::string& data, const std::string& signature) {
+    try {
+        const nl::json request_payload = {
+            {"jsonrpc", "2.0"},
+            {"id", "0"},
+            {"method", "verify"},
+            {"params", {
+                {"data", data},
+                {"address", address},
+                {"signature", signature}
+            }}
+        };
+        const std::string payload = request_payload.dump();
+
+        cpr::Header headers = cpr::Header{std::make_pair("Content-Type", "application/json")};
+        cpr::Response res = cpr::Post(
+            cpr::Url{WALLET_URL},
+            headers,
+            cpr::Body{payload},
+            cpr::ConnectTimeout{wallet_connect_timeout_ms},
+            cpr::Timeout{wallet_request_timeout_ms});
+
+        if (res.status_code != 200) {
+            logger << "[ERROR] Wallet gave invalid response for verify. Status code: " << res.status_code << std::endl;
+            return false;
+        }
+
+        nl::json parsed = nl::json::parse(res.text);
+        if (parsed.contains("error")) {
+            logger << "[RPC ERROR] verify: " << parsed["error"].dump() << std::endl;
+            return false;
+        }
+
+        return parsed["result"].value("good", false);
+    } catch (const std::exception& e) {
+        logger << "[EXCEPTION] Unexpected error in verifySignature: " << e.what() << std::endl;
+        return false;
+    }
 }

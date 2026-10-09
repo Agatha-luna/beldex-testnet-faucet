@@ -8,17 +8,23 @@ Install the following system libraries before building:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential cmake libssl-dev libasio-dev libsqlite3-dev libcurl4-openssl-dev
+sudo apt install -y build-essential cmake libssl-dev libboost-dev libsqlite3-dev libcurl4-openssl-dev
 ```
 
 | Library | Purpose |
 | --- | --- |
 | `build-essential` | C++ compiler and build tools |
-| `cmake` (>= 3.14) | Build system |
+| `cmake` (>= 3.15) | Build system |
 | `libssl-dev` | OpenSSL, required by CPR (HTTP client) |
-| `libasio-dev` | Standalone Asio, required by Crow |
+| `libboost-dev` | Header-only Boost.Asio, required by Crow |
 | `libsqlite3-dev` | SQLite3, used for rate-limit tracking |
 | `libcurl4-openssl-dev` | libcurl, required by CPR (system curl backend) |
+
+On macOS with Homebrew:
+
+```bash
+brew install cmake openssl boost sqlite curl
+```
 
 ## How to Clone the Repository
 
@@ -45,12 +51,13 @@ cp .env.example .env
 
 | Variable | Description |
 | --- | --- |
-| `WALLET_URL` | Beldex wallet RPC endpoint (`/json_rpc`) used to validate addresses and send faucet funds |
+| `WALLET_URL` | Beldex wallet RPC endpoint (`/json_rpc`) used to validate addresses, verify signatures and send faucet funds |
 | `FAUCET_AMOUNT` | Amount sent per request, in atomic units (e.g. `150000000000` = 150 BDX) |
 | `FAUCET_DATABASE` | SQLite database file path used for rate-limit tracking |
 | `CAPTCHA_SECRET_KEY` | Cloudflare Turnstile secret key used to verify every faucet request |
+| `FAUCET_SIGN_SECRET` | Secret used to HMAC-sign wallet-ownership challenges. Generate with `openssl rand -hex 32` |
 
-All four are required to process faucet requests.
+All five are required to process faucet requests.
 
 ## CAPTCHA setup
 
@@ -68,6 +75,19 @@ Missing, rejected, expired or reused tokens cannot request funds; verification
 outages also block transfers. The widget resets after each request.
 
 See https://developers.cloudflare.com/turnstile/get-started/ for key setup.
+
+## Proof of wallet ownership
+
+Before paying out, the faucet also requires proof that the requester controls the
+private key for the requested address:
+
+1. `GET /challenge?address=<testnet address>` returns a short-lived (5 minute), HMAC-signed challenge bound to that address.
+2. The client signs that exact challenge with the connected Beldex Wallet.
+3. `POST /transfer` requires `{ "address", "captcha_token", "challenge", "signature" }`. The backend validates the CAPTCHA and challenge, then uses the wallet RPC `verify` method to verify the signature.
+
+This prevents requests using harvested addresses whose private keys the requester
+does not control. It does not prevent someone from creating and controlling many
+new wallets.
 
 ## Build Instructions
 
