@@ -6,8 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CPR_FORCE_USE_SYSTEM_CURL ON)
 
-# Crow is header-only. Expose its include path and Boost.Asio configuration to
-# every target through one interface target.
+# Crow is header-only. Expose it through a CMake target so its include path and
+# Boost.Asio configuration are inherited by every target that uses Crow.
 find_package(Boost 1.64 REQUIRED)
 find_package(Threads REQUIRED)
 add_library(crow INTERFACE)
